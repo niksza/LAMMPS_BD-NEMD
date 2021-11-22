@@ -1,0 +1,160 @@
+#	||-------------------------------------------------------------------------||#  
+#	||                  State University of Campinas - UNICAMP                 ||# 
+#	||             Laboratory of Complex Systems Engineering - LESC            ||# 
+#	||-------------------------------------------------------------------------||# 
+#	||LAMMPS script for NEMD with temperature gradient.                        ||#
+#	||                                                                         ||#
+#	||-------------------------------------------------------------------------||#
+#	||Nikolas F. de Souza, Marcelle Spera                                      ||#
+#	||Jun 2021                                                                 ||#
+#	||-------------------------------------------------------------------------||#
+
+## INPUTS ################################################################################
+#Thermal regions--------------------------------------------------------------------------
+variable 	LenTR	equal 	0.03125 					  	  #|| Lenght of thermal regions in reduced units
+#variable	HeatF	string 	HeX						  	  #|| Heat flux algorith: 1.PeX 2.HeX 3.eHeX 4.Langevin	
+variable    	T  	equal 	115.56						  	  #|| Average temperature
+variable	deltaT	equal 	25							  #|| Temperature increment [for Langevin algorithm]
+variable	eflux	equal 	0.00142219						  #|| Energy flux [for HeX and eHeX]
+#Simulation-------------------------------------------------------------------------------
+variable    	rc 	equal 	8.80 							  #|| Cut-off Ratio
+variable    	seed 	equal 	52364 							  #|| Seed Value
+#variable 	input 	string 	Ar&Kr_LJ						  #|| Name of .lmp file for read_data command
+variable 	nmol1 	equal 	250							  #|| Number of molecules of component 01
+variable 	nmol2 	equal 	250							  #|| Number of molecules of component 02
+#Simulation steps-------------------------------------------------------------------------
+variable 	NVTeq	equal 	500000							  #|| NVT ensemble equilibration time
+variable 	NVEeq	equal 	10000000 						  #|| NVE ensemble equilibration time
+variable 	NVEprod	equal 	70000000 						  #|| NVE ensemble production time
+
+## CONSTANTS #############################################################################
+variable	Thot  	equal 	v_T+v_deltaT				  		  #|| Temperature of the hot region
+variable    	Tcold   equal 	v_T-v_deltaT				  		  #|| Temperature of the cold region (Used in Langevin alg.)
+
+## INITIALIZATION ########################################################################
+units		real  									  #|| LAMMPS setup configuration
+atom_style	full  
+pair_style	lj/cut ${rc} 
+bond_style	harmonic
+angle_style	harmonic
+dihedral_style	opls
+pair_modify	shift no mix arithmetic tail yes
+read_data	${input}.lmp
+velocity	all create ${T} ${seed}
+
+## SIMULATION SETTINGS ###################################################################
+#Thermal regions definition---------------------------------------------------------------
+variable    	xlo  equal xlo				 				  #|| Ensemble dimensions
+variable    	xhi  equal xhi								  #|| x/y lo: lower box x/y dimension
+variable 	ylo  equal ylo								  #|| x/y hi: higher box x/y dimnsion
+variable 	yhi  equal yhi								  #||
+variable    	Lz   equal zhi-zlo							  #|| Lz = Total z length 
+
+variable 	zlo_c  	equal zlo 							  #|| zlo_c = Initial position for cold region
+variable 	zhi_c  	equal ${zlo_c}+${LenTR}*2*${Lz} 				  #|| zhi_c = End position for cold region		
+variable 	zlo_h  	equal 0.5*(zlo+zhi)						  #|| zlo_h = Initial position for hot  region 
+variable 	zhi_h  	equal ${zlo_h}+${LenTR}*2*${Lz}					  #|| zhi_h = End position for hot  region
+
+variable 	r1_hi 	equal ${zhi_c}+${LenTR}*${Lz}
+variable 	r3_lo 	equal ${r1_hi}+12*${LenTR}*${Lz}
+
+variable 	slabvol equal (xhi-xlo)*(yhi-ylo)*${LenTR}*${Lz}			  #|| Volume of each slab
+#Setup of thermal regions-----------------------------------------------------------------
+region 	rhot  block ${xlo} ${xhi} ${ylo} ${yhi} ${zlo_h} ${zhi_h}		  	  #|| Defines a geometric region of the box volum for the 
+region	rcold block ${xlo} ${xhi} ${ylo} ${yhi} ${zlo_c} ${zhi_c}		  	  #|| 	hot and cold region.
+
+region  r1     block ${xlo} ${xhi} ${ylo} ${yhi} ${zhi_c} ${r1_hi}
+region  r2     block ${xlo} ${xhi} ${ylo} ${yhi} ${r1_hi} ${r3_lo}
+region  r3     block ${xlo} ${xhi} ${ylo} ${yhi} ${r3_lo} ${zlo_h}
+
+group   grhot  	dynamic all region rhot							  #|| Group only the atoms that are inside the region.
+group   grcold 	dynamic all region rcold						  #||
+group 	g1      dynamic all region r1
+group 	g2      dynamic all region r2
+group 	g3      dynamic all region r3
+
+compute Thot  all temp/region rhot						  	  #|| Compute the temperature of a group of atoms in a geometric region
+compute Tcold all temp/region rcold						  	  #|| In this case, the rhot and rcold regions.
+
+##|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||#
+##||||||||||||||||||||||||||||||||	SIMULATION	|||||||||||||||||||||||||||||||||#
+##|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||#
+
+## EQUILIBRATION #########################################################################
+#NVT Ensemble-----------------------------------------------------------------------------
+fix         	NVT all nvt temp $T $T 100                                                #|| Equilibration run on NVT emsemble;
+thermo	    	5000									  #||
+run         	${NVTeq}								  #||
+velocity	all scale $T 							  	  #|| Rescaling velocities to the average temperature T;
+unfix		NVT 								  	  #||
+#Box division in bins and molecule counting-----------------------------------------------
+compute 	layers 	all chunk/atom bin/1d z lower ${LenTR} units reduced 		  #|| Create the bins on z-direction
+
+group	 	C1  	molecule <= ${nmol1}  						  #|| Identify a collection of molecules as belonging to a group;
+group	 	C2  	molecule  > ${nmol1}  						  #|| Molecules ID's are generated in the read_data file.
+
+compute 	countC1 C1 property/chunk layers count					  #|| Count atoms on each bin
+compute 	countC2 C2 property/chunk layers count 					  #||
+
+variable 	molfrac vector c_countC1/(c_countC1+c_countC2)
+#Heat flux based on contributions from atoms----------------------------------------------
+compute		ke 	all ke/atom 							  #|| Computes per-atom translational kinetic energy for each atom 
+compute		pe 	all pe/atom 							  #|| Computes potential energy for each atom 
+compute		stress 	all stress/atom NULL virial 					  #|| Computes per-atom stress tensor for each atom 
+
+compute 	boxke  	all ke
+compute 	boxpe 	all pe
+variable 	etotal  equal c_boxpe+c_boxke
+
+compute 	forceg1	g1  pair/local fz fx fy
+compute 	forceg2	g2  pair/local fz fx fy
+compute 	forceg3	g3  pair/local fz fx fy
+
+variable	cf_energy	equal 	6.947687e14/${slabvol}			  	  #|| Conversion factor [kcal/A²*fs*mol]/[A³] -> [W/m²].
+variable 	cf_stress	equal 	1.01325e10/${slabvol}				  #|| Conversion factor [atm*A²/fs]/[A³]      -> [W/m²].
+#Z direction----------------------------------------------------------------------------------------
+variable 	hflux_jcz 	atom (c_ke+c_pe)*vz*${cf_energy}		 	  	    #|| Kinect and potential energy contribuition for flux.
+variable 	hflux_jvz 	atom -1*(c_stress[5]*vx+c_stress[6]*vy+c_stress[3]*vz)*${cf_stress} #|| Energy transferred due to motion of a part. in the field of the other part.
+variable 	hflux_z 	atom v_hflux_jcz+v_hflux_jvz				  	    #|| Total heat flux.
+#X direction----------------------------------------------------------------------------------------#|| 
+variable 	hflux_jcx 	atom (c_ke+c_pe)*vx*${cf_energy} 				    #|| 
+variable 	hflux_jvx 	atom -1*(c_stress[1]*vx+c_stress[4]*vy+c_stress[5]*vz)*${cf_stress} #||   
+variable 	hflux_x 	atom v_hflux_jcx+v_hflux_jvx				            #||		
+#Y direction----------------------------------------------------------------------------------------#||
+variable 	hflux_jcy 	atom (c_ke+c_pe)*vy*${cf_energy} 				    #||
+variable 	hflux_jvy 	atom -1*(c_stress[4]*vx+c_stress[2]*vy+c_stress[6]*vz)*${cf_stress} #||   
+variable 	hflux_y 	atom v_hflux_jcy+v_hflux_jvy				            #||
+#Savings--------------------------------------------------------------------------------------------
+fix		z_calcflux 	all ave/chunk 200 50000 10000000 layers v_hflux_z v_hflux_jcz v_hflux_jvz norm none file zflux_${HeatF}_${input}.profile 	  
+fix		x_calcflux 	all ave/chunk 200 50000 10000000 layers v_hflux_x v_hflux_jcx v_hflux_jvx norm none file xflux_${HeatF}_${input}.profile 	  
+fix 		y_calcflux 	all ave/chunk 200 50000 10000000 layers v_hflux_y v_hflux_jcy v_hflux_jvy norm none file yflux_${HeatF}_${input}.profile 	 
+fix		chunk_temp 	all ave/chunk 200 50000 10000000 layers temp file temp_${HeatF}_${input}.profile
+fix 		count 		all ave/time  200 1 200 c_countC1 c_countC2 mode vector
+fix 		molfrac 	all ave/time  200 1 200 v_molfrac file molfrac_${HeatF}_${input}.profile mode vector
+fix 		energy 		all ave/time  200 50000 10000000 v_etotal file energy_${HeatF}_${input}.profile
+#NVE Ensemble-----------------------------------------------------------------------------
+fix 		NVE 	 all nve	 							  #|| Equilibration run on NVE
+variable    	Tdiff equal c_Thot-c_Tcold 	
+fix 		ave_temp all ave/time 20000 1 20000 c_Thot c_Tcold v_Tdiff ave running
+thermo_style	custom step f_ave_temp[1] f_ave_temp[2] f_ave_temp[3] 
+thermo	        20000
+run             ${NVEeq}
+#Thermal exchange algorithm---------------------------------------------------------------
+if "${HeatF} == PeX" then &
+ "variable nbins equal 1/(2*v_LenTR)" &
+ "fix 3 all thermal/conductivity 480 z ${nbins}" &
+elif "${HeatF} == HeX" &
+ "fix rhot all heat 1  ${eflux} region rhot" &
+ "fix rcold all heat 1 -${eflux} region rcold" &
+elif "${HeatF} == eHeX" &
+ "fix 	rhot  all ehex 1  ${eflux} region rhot" & 
+ "fix 	rcold all ehex 1 -${eflux} region rcold" & 
+elif "${HeatF} == Langevin" &
+ "fix 		rhot  all langevin ${Thot}  ${Thot}  50.0 59804  tally yes" &
+ "fix 		rcold all langevin ${Tcold} ${Tcold} 50.0 287859 tally yes" &
+ "fix_modify  	rhot  temp Thot" &
+ "fix_modify 	rcold temp Tcold" 
+
+## PRODUCTION ############################################################################
+#Running---------------------------------------------------------------------------------
+run		${NVEprod}
